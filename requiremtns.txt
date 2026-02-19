@@ -1,0 +1,14 @@
+ pandas
+ torch torchvision --index-url https://download.pytorch.org/whl/cu126
+ scikit-learn 
+ scipy 
+ transformers
+ tqdm
+ pandas 
+ numpy 
+ matplotlib 
+ jupyterlab 
+ albumentations
+ lightning
+ opencv-python
+ ipywidgets
