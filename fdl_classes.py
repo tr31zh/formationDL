@@ -132,13 +132,16 @@ checkpoints_dict = {
 
 # Load image and convert to RGB
 def load_image(file_name):
-    path = (
-        Path(".")
-        .joinpath("data")
-        .joinpath("images")
-        .joinpath(file_name)
-        .with_suffix(".jpg")
-    )
+    if Path(file_name).is_file():
+        path = file_name
+    else:
+        path = (
+            Path(".")
+            .joinpath("data")
+            .joinpath("images")
+            .joinpath(file_name)
+            .with_suffix(".jpg")
+        )
 
     try:
         img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
@@ -174,7 +177,15 @@ class FldDataset(Dataset):
             test_mode (bool, optional): If true images will not be normalized and transformed into tensors. Defaults to False.
         """
         super().__init__()
-        self.dataframe = dataframe
+        if isinstance(dataframe, str) is True:
+            self.dataframe = pd.DataFrame(data={"image": [dataframe]})
+        elif isinstance(dataframe, list) is True:
+            self.dataframe = pd.DataFrame(data={"image": dataframe})
+        elif isinstance(dataframe, pd.DataFrame) is True:
+            self.dataframe = dataframe
+        else:
+            raise NotImplementedError()
+
         if columns:
             self.dataframe = self.dataframe[["image"] + columns]
         transforms = [
