@@ -3,3 +3,6 @@
 /data
 /env
 /lightning_logs
+/mlruns
+/tmp
+*.db

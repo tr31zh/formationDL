@@ -10,10 +10,11 @@ from rich import print as pprint
 import numpy as np
 import pandas as pd
 import cv2
-from PIL import Image
+
+import matplotlib.pyplot as plt
 
 from sklearn.metrics import roc_curve
-from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import classification_report
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -24,11 +25,13 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import StepLR
 
+from torchvision.models import swin_v2_b, Swin_V2_B_Weights
+
 from torchmetrics.classification import MultilabelF1Score
 
 import ignite
 from ignite.engine import Engine, Events
-from ignite.metrics import Loss
+from ignite.metrics import Loss, Accuracy, Precision, Recall
 from ignite.handlers import ModelCheckpoint, EarlyStopping
 from ignite.contrib.handlers import global_step_from_engine
 from ignite.handlers.tqdm_logger import ProgressBar
@@ -42,7 +45,6 @@ from mlflow.pytorch import log_model
 from mlflow.entities import RunStatus
 
 from livelossplot import PlotLossesIgnite
-from matplotlib.figure import Figure
 
 from transformers import (
     ViTForImageClassification,
@@ -86,7 +88,6 @@ def get_device() -> str:
     Returns:
         str: device
     """
-    return "cpu"
     return (
         "mps"
         if torch.backends.mps.is_built() is True
@@ -316,23 +317,46 @@ class FldDataset(Dataset):
         return self.dataframe.iloc[index]
 
 
+# MARK: Loss
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction: str = "mean"):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        bce_loss = nn.functional.binary_cross_entropy_with_logits(
+            inputs, targets, reduction="none"
+        )
+
+        focal_loss = self.alpha * (1 - torch.exp(-bce_loss)) ** self.gamma * bce_loss
+
+        match self.reduction:
+            case "mean":
+                return focal_loss.mean()
+            case "sum":
+                return focal_loss.sum()
+            case _:
+                return focal_loss
+
+
 # MARK: Model
 class FdlNet(nn.Module):
-
     def __init__(
         self,
-        labels,
+        labels: list,
         augmentations: A.Compose,
         backbone: str = "hf_swt_t",
         device: str | None = None,
     ):
-        """Create model
+        """Creates the classification model
 
         Args:
-            architecture (str): Base architecture, see https://github.com/qubvel/segmentation_models for list of architectures
-            encoder_name (str): Encoder, see https://github.com/qubvel/segmentation_models for available encoders
-            transform (A.Compose): Transformation
-            device (str, optional): Selected device. Defaults to None.
+            labels (list): List of target labels
+            augmentations (A.Compose): Input layer augmentation
+            backbone (str, optional): Selected backbone. Defaults to "hf_swt_t".
+            device (str | None, optional): Selected device. If None, best device is selected. Defaults to None.
         """
         super(FdlNet, self).__init__()
         self.backbone = backbone
@@ -342,6 +366,7 @@ class FdlNet(nn.Module):
         # Model
         chk_data = checkpoints_dict[backbone]
         self.labels = labels
+        # self.encoder = swin_v2_b(weights=Swin_V2_B_Weights.DEFAULT)
         self.encoder = chk_data["class"].from_pretrained(
             chk_data["path"],
             num_labels=len(labels),
@@ -350,23 +375,23 @@ class FdlNet(nn.Module):
             problem_type="multi_label_classification",
             ignore_mismatched_sizes=True,
         )
-
-        self.flatten = nn.Flatten()
-        self.linear_out = nn.LazyLinear(len(labels))
-
+        self.linear = nn.Linear(len(labels), len(labels))
+        # self.linear = nn.Linear(1000, len(labels))
         self.sigmoid = nn.Sigmoid()
         self.device = device if device is not None else get_device()
 
     def forward(self, x):
-        x = self.encoder(x)
-        if self.backbone in checkpoints_dict.keys():
-            x = x.logits
-        x = self.flatten(x)
-        x = self.linear_out(x)
+        x = self.encoder(x).logits
+        x = self.linear(x)
         x = self.sigmoid(x)
         return x
 
     def to_logger(self) -> dict:
+        """Model data added to log
+
+        Returns:
+            dict: data dictionnary
+        """
         return {k: getattr(self, k) for k in ["backbone", "labels", "device"]}
 
     def hr_desc(self):
@@ -380,13 +405,24 @@ class FdlNet(nn.Module):
 
         Console().print(table)
 
-    def get_labels(self, dataset: FldDataset):
-        return (
-            torch.stack([sample["labels"].int() for sample in dataset])
-            .detach()
-            .cpu()
-            .numpy()
-        )
+    def get_labels(self, dataset: FldDataset) -> np.array:
+        """Returns dataset's ground truth data
+
+        Args:
+            dataset (FldDataset): Target dataset
+
+        Returns:
+            np.array: Ground truth
+        """
+        return dataset.dataframe.iloc[
+            :,
+            (
+                2
+                if len(dataset.dataframe.columns) > 1
+                and dataset.dataframe.columns[1] == "site"
+                else 1
+            ) :,
+        ].values
 
     def predict_propabilities(
         self,
@@ -394,7 +430,7 @@ class FdlNet(nn.Module):
         batch_size: int = 32,
         num_workers: int = 10,
         silent: bool = False,
-    ):
+    ) -> np.array:
         self.eval()
         self.to(get_device())
         dataloader = DataLoader(
@@ -450,6 +486,8 @@ class FdlNet(nn.Module):
             for i in range(len(self.labels))
         ]
 
+        return self.thresholds
+
     def predict_labels(
         self, dataset: FldDataset, batch_size: int = 32, num_workers: int = 10
     ):
@@ -465,45 +503,52 @@ class FdlNet(nn.Module):
             axis=-1,
         )
 
-    def predict_to_dataframe(
+    def get_val_data(
         self, dataset: FldDataset, batch_size: int = 32, num_workers: int = 10
     ):
-        labels = self.predict_labels(
+        predictions = self.predict_labels(
             dataset=dataset, batch_size=batch_size, num_workers=num_workers
         )
-        probas = self.predict_propabilities(
-            dataset=dataset, batch_size=batch_size, num_workers=num_workers
+        labels = self.get_labels(dataset=dataset)
+
+        cutoff = (
+            2
+            if len(dataset.dataframe.columns) > 1
+            and dataset.dataframe.columns[1] == "site"
+            else 1
         )
+        predictions_revue = dataset.dataframe.iloc[:, :cutoff]
+
         for i, label in enumerate(self.labels):
-            insert_position = dataset.columns.to_list().index(label) + 1
-            dataset = dataset.drop([label, f"p_{label}"], axis=1, errors="ignore")
-            dataset.insert(insert_position, label, labels[:, i])
-            dataset.insert(insert_position, f"p_{label}", probas[:, i])
-        return dataset
+            predictions_revue.insert(cutoff + i * 3, f"y_{label}", predictions[:, i])
+            predictions_revue.insert(cutoff + i * 3, f"ŷ_{label}", labels[:, i])
+            predictions_revue.insert(
+                cutoff + i * 3, f"{label}", predictions[:, i] == labels[:, i]
+            )
 
-    def classification_report_as_dict(
-        self, dataset: FldDataset, batch_size: int = 32, num_workers: int = 10
-    ):
-        y_proba, y_true = self.get_probas_and_labels(
-            dataset=dataset,
-            batch_size=batch_size,
-            num_workers=num_workers,
-        )
-        y_pred = self.predict_labels(
-            dataset=dataset,
-            y_true=y_true,
-            y_proba=y_proba,
-            batch_size=batch_size,
-            num_workers=num_workers,
-        )
-
-        return classification_report(
-            y_true,
-            y_pred,
+        report_dict = classification_report(
+            labels,
+            predictions,
             target_names=self.labels,
             zero_division=0,
             output_dict=True,
         )
+        report_data = {
+            "labels": [],
+            "precision": [],
+            "recall": [],
+            "f1-score": [],
+            "support": [],
+        }
+        for k, v in report_dict.items():
+            report_data["labels"].append(k)
+            for c in ["precision", "recall", "f1-score", "support"]:
+                report_data[c].append(v[c])
+
+        return {
+            "predictions_revue": predictions_revue,
+            "classification_report": pd.DataFrame(data=report_data),
+        }
 
 
 # MARK: Train
@@ -523,6 +568,7 @@ def prepare_datasets(
     train: pd.DataFrame,
     val: pd.DataFrame,
     batch_size: int,
+    num_workers: int,
     print_steps: str | None = "pprint",
 ) -> tuple:
     lcl_print("Creating datasets", print_steps=print_steps)
@@ -533,8 +579,12 @@ def prepare_datasets(
     val_dataset = FldDataset(data=val, train_mode=False)
 
     lcl_print("Creating dataloaders", print_steps=print_steps)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
 
     return train_dataset, val_dataset, train_loader, val_loader
 
@@ -544,6 +594,8 @@ def prepare_model(
     labels: list,
     image_size: int,
     learning_rate: float = 0.0005,
+    loss_name: str = "bce",
+    loss_params: dict = {"alpha": 0.5, "gamma": 1},
     device: str = get_device(),
     print_steps: str | None = "pprint",
 ) -> tuple:
@@ -558,10 +610,30 @@ def prepare_model(
 
     lcl_print("Optimizer & criterion", print_steps=print_steps)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.BCEWithLogitsLoss()
+
+    def output_transform(output):
+        y_pred, y = output
+        return y_pred.gt(0.5).long(), y.long()
+
+    match loss_name:
+        case "bce":
+            criterion = nn.BCEWithLogitsLoss()
+        case "focal":
+            criterion = FocalLoss(**loss_params, reduction="mean")
+        case _:
+            raise NotImplementedError(f"Unknown loss: {loss_name}")
+    precision = Precision(
+        average="macro", is_multilabel=True, output_transform=output_transform
+    )
+    recall = Recall(
+        average="macro", is_multilabel=True, output_transform=output_transform
+    )
+    f1 = precision * recall * 2 / (precision + recall)
     val_metrics = {
-        "loss": Loss(criterion),
-        "F1": MultilabelF1Score(num_labels=len(labels), average="macro"),
+        "Loss": Loss(criterion),
+        "Precision": precision,
+        "Recall": recall,
+        "F1": f1,
     }
 
     return model, criterion, optimizer, val_metrics
@@ -584,7 +656,7 @@ def prepare_trainer(
     def train_step(engine, batch):
         model.train()
         optimizer.zero_grad()
-        x, y = batch[0].to(device), batch[1].to(device)
+        x, y = batch["image"].to(device), batch["labels"].to(device)
         y_pred = model(x)
         loss = criterion(y_pred, y)
         loss.backward()
@@ -596,7 +668,7 @@ def prepare_trainer(
     def validation_step(engine, batch):
         model.eval()
         with torch.no_grad():
-            x, y = batch[0].to(device), batch[1].to(device)
+            x, y = batch["image"].to(device), batch["labels"].to(device)
             y_pred = model(x)
             return y_pred, y
 
@@ -618,13 +690,14 @@ def prepare_trainer(
     def log_validation_results(trainer):
         val_evaluator.run(val_loader)
         metrics = val_evaluator.state.metrics
+        metric_data = " | ".join([f"{k}: {v:.3}" for k, v in metrics.items()])
         lcl_print(
-            f"Validation Results - Epoch[{trainer.state.epoch}] -> Dice: {metrics['Dice']:.5f} IoU: {metrics['IoU']:.5f}",
+            f"Validation Results - Epoch[{trainer.state.epoch}] -> {metric_data}",
             print_steps=print_steps,
         )
 
     if log_progress is True:
-        ProgressBar().attach(trainer, output_transform=lambda x: {"loss": x})
+        ProgressBar().attach(trainer, output_transform=lambda x: {"Loss": x})
     if plot_loss is True:
         callback = PlotLossesIgnite()
         callback.attach(val_evaluator)
@@ -634,7 +707,7 @@ def prepare_trainer(
 
 # Score function to return current value of any metric we defined above in val_metrics
 def score_function(engine):
-    return engine.state.metrics["loss"]
+    return -engine.state.metrics["Loss"]
 
 
 def add_checkpoint_saving(
@@ -688,19 +761,21 @@ def find_lr(
     trainer, model, optimizer, train_loader, print_steps: str | None = "pprint"
 ):
     lcl_print("LR finder", print_steps=print_steps)
+    lr_finder = FastaiLRFinder()
     try:
-        lr_finder = FastaiLRFinder()
-
         # To restore the model's and optimizer's states after running the LR Finder
         with lr_finder.attach(
             trainer,
             to_save={"model": model, "optimizer": optimizer},
-            start_lr=0.00001,
-            end_lr=1.0,
+            start_lr=0.000000001,
+            end_lr=5.0,
         ) as trainer_with_lr_finder:
             trainer_with_lr_finder.run(train_loader)
-
         lr_finder.apply_suggested_lr(optimizer)
+        mlflow.log_params({"suggested LR": lr_finder.lr_suggestion()})
+        fig, ax = plt.subplots()
+        lr_finder.plot(ax=ax, skip_start=0, skip_end=0)
+        mlflow.log_figure(fig, artifact_file="images/lr_finder.png")
     except Exception as e:
         lcl_print(f"failure_class: {type(e).__name__}", print_steps="print")
         lcl_print(f"failure_message: {str(e)}", print_steps="print")
@@ -807,41 +882,39 @@ def add_logger(
 def upload_model_to_logger(
     model: FdlNet,
     mlf_logger,
-    val_full,
     val_dataset,
     device: str = get_device(),
-    log_progress: bool = True,
     print_steps: str | None = "pprint",
     batch_size: int = 32,
     num_workers: int = 10,
 ):
     lcl_print("Uploading model", print_steps=print_steps)
-    state_dict = torch.load(PT_TMP_CHK_IGNITE.joinpath(TMP_IGNITE_CHKPT_NAME))
-    model.load_state_dict(state_dict)
-
     model.set_thresholds(
-        dataset=val_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        silent=log_progress is False,
-    )
-
-    log_csv(val_full, "val_full", folder_name="datasets")
-    lcl_print("Performing validation", print_steps=print_steps)
-    eval_data = model.predict_to_dataframe(
         dataset=val_dataset, batch_size=batch_size, num_workers=num_workers
     )
 
-    lcl_print("Uploading datasets", print_steps=print_steps)
-    log_csv(df=eval_data, name="eval_data", folder_name="metrics")
-
-    mlflow.log_figure(
-        model.demo_plant(df=val_full, treatment="DC", sample_count=6),
-        artifact_file="images/plant_demo.png",
+    lcl_print("Performing validation", print_steps=print_steps)
+    val_data = model.get_val_data(dataset=val_dataset)
+    log_csv(
+        df=val_data["predictions_revue"],
+        name="predictions_revue",
+        folder_name="metrics",
+    )
+    log_csv(
+        df=val_data["classification_report"],
+        name="classification_report",
+        folder_name="metrics",
+    )
+    mlflow.log_params(
+        {
+            f"F1_{label}": fscore
+            for label, fscore in val_data["classification_report"][
+                ["labels", "f1-score"]
+            ].values
+        }
     )
 
-    test_batch, _ = val_dataset[0]
-    test_batch = test_batch.unsqueeze(0)
+    test_batch = val_dataset[0]["image"].unsqueeze(0)
     signature = infer_signature(
         model_input=test_batch.numpy(),
         model_output=model(test_batch.to(device)).detach().cpu().numpy(),
@@ -857,6 +930,8 @@ def train_model(
     max_epochs: int,
     image_size: int,
     backbone: str = "hf_swt_t",
+    loss_name: str = "bce",
+    loss_params: dict = {"alpha": 0.5, "gamma": 1},
     device: str = get_device(),
     checkpoints_n_saved: int = 1,
     learning_rate: float = 0.01,
@@ -868,12 +943,9 @@ def train_model(
     print_steps: str | None = "pprint",
     log_progress: bool = True,
     plot_loss: bool = True,
-    upload_model: bool = True,
-    is_test: bool = False,
-    skip_logger: bool = False,
     num_workers: int = 10,
 ) -> FdlNet:
-    labels = train_data.columns[:2]
+    labels = train_data.columns[2:]
 
     # Create datasets
     train_dataset, val_dataset, train_loader, val_loader = prepare_datasets(
@@ -881,6 +953,7 @@ def train_model(
         val=val_data,
         batch_size=batch_size,
         print_steps=print_steps,
+        num_workers=num_workers,
     )
 
     # Prepare model
@@ -889,6 +962,8 @@ def train_model(
         labels=labels,
         image_size=image_size,
         learning_rate=learning_rate,
+        loss_name=loss_name,
+        loss_params=loss_params,
         device=device,
         print_steps=print_steps,
     )
@@ -906,15 +981,6 @@ def train_model(
         plot_loss=plot_loss,
         print_steps=print_steps,
     )
-
-    if use_lr_finder is True:
-        find_lr(
-            trainer=trainer,
-            model=model,
-            optimizer=optimizer,
-            train_loader=train_loader,
-            print_steps=print_steps,
-        )
 
     # Checkpoint saver
     add_checkpoint_saving(
@@ -946,11 +1012,6 @@ def train_model(
         print_steps=print_steps,
     )
 
-    if skip_logger is True:
-        lcl_print("Training model", print_steps=print_steps)
-        trainer.run(train_loader, max_epochs=max_epochs)
-        return model
-
     try:
         # Add logger
         mlf_logger = add_logger(
@@ -973,12 +1034,10 @@ def train_model(
                 "lr_scheduler_gamma": lr_scheduler_gamma,
                 "optimizer": type(optimizer).__name__,
                 "criterion": type(criterion).__name__,
-                "encoder_name": encoder_name,
-                "test_run": is_test,
                 "use_lr_finder": use_lr_finder,
                 "log_progress": log_progress,
                 "plot_loss": plot_loss,
-                "upload_model": upload_model,
+                "num_workers": num_workers,
             },
             optimizer=optimizer,
             train=train_data,
@@ -991,21 +1050,36 @@ def train_model(
             print_steps=print_steps,
         )
 
+        # Log loss data only if not BCE
+        if loss_params and loss_name != "bce":
+            for k, v in loss_params.items():
+                mlflow.log_params({f"loss_{k}": v})
+
+        if use_lr_finder is True:
+            find_lr(
+                trainer=trainer,
+                model=model,
+                optimizer=optimizer,
+                train_loader=train_loader,
+                print_steps=print_steps,
+            )
+
         # Train model
         lcl_print("Training model", print_steps=print_steps)
         trainer.run(train_loader, max_epochs=max_epochs)
 
+        lcl_print("Restore best model", print_steps=print_steps)
+        state_dict = torch.load(PT_TMP_CHK_IGNITE.joinpath(TMP_IGNITE_CHKPT_NAME))
+        model.load_state_dict(state_dict)
+
         # Upload model
-        if upload_model is True:
-            upload_model_to_logger(
-                model=model,
-                mlf_logger=mlf_logger,
-                val_full=val_data,
-                val_dataset=val_dataset,
-                device=device,
-                log_progress=log_progress,
-                print_steps=print_steps,
-            )
+        upload_model_to_logger(
+            model=model,
+            mlf_logger=mlf_logger,
+            val_dataset=val_dataset,
+            device=device,
+            print_steps=print_steps,
+        )
     except Exception as e:
         try:
             mlflow.log_params({"failure_class": type(e).__name__})
