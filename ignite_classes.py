@@ -953,7 +953,7 @@ def train_model(
         batch_size (int): Batch size
         max_epochs (int): Max number of allowed epochs
         image_size (int): Training image size
-        backbone (str, optional): Selected backbone, one of "" keys. Defaults to "hf_swt_t".
+        backbone (str, optional): Selected backbone, one of "checkpoints_dict" keys. Defaults to "hf_swt_t".
         loss_name (str, optional): Loss name, either "bce" or "focal". If "focal" is selected, loss_params may contain a value for "alpha" and "gamma". Defaults to "bce".
         loss_params (dict, optional): Arguments for the focal loss. Defaults to {"alpha": 0.5, "gamma": 1}.
         device (str, optional): Selected device, if unset, best one will be selected. Defaults to get_device().

@@ -6,3 +6,4 @@
 /mlruns
 /tmp
 *.db
+.DS_Store
