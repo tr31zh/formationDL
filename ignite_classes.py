@@ -945,6 +945,33 @@ def train_model(
     plot_loss: bool = True,
     num_workers: int = 10,
 ) -> FdlNet:
+    """Trains a multilabel classifier model
+
+    Args:
+        train_data (pd.DataFrame): Dataframe containing the training data
+        val_data (pd.DataFrame): Dataframe containing the validation data
+        batch_size (int): Batch size
+        max_epochs (int): Max number of allowed epochs
+        image_size (int): Training image size
+        backbone (str, optional): Selected backbone, one of "" keys. Defaults to "hf_swt_t".
+        loss_name (str, optional): Loss name, either "bce" or "focal". If "focal" is selected, loss_params may contain a value for "alpha" and "gamma". Defaults to "bce".
+        loss_params (dict, optional): Arguments for the focal loss. Defaults to {"alpha": 0.5, "gamma": 1}.
+        device (str, optional): Selected device, if unset, best one will be selected. Defaults to get_device().
+        checkpoints_n_saved (int, optional): Number of best checkpoints to be saved. Defaults to 1.
+        learning_rate (float, optional): Starting learning rate. Defaults to 0.01.
+        early_stoper_patience (int, optional): Early stopper patience. If the model does not improve within patience epochs, training will stop. Defaults to 10.
+        early_stoper_min_delta (float, optional): Min delta to be considered an improvement. Defaults to 0.
+        use_lr_finder (bool, optional): USe LR finder to find best learning rate. HIGHLY EXPERIMENTAL. Defaults to False.
+        lr_scheduler_step (int, optional): LR scheduler step. Defaults to -1.
+        lr_scheduler_gamma (float, optional): LR scheduler gamma. Defaults to 0.9.
+        print_steps (str | None, optional): Print steps mode. If "None", no info will be outputed. Defaults to "pprint".
+        log_progress (bool, optional): Log training progress?. Defaults to True.
+        plot_loss (bool, optional): Plot loss while training. Defaults to True.
+        num_workers (int, optional): Num workers for paralel training. Higher values speed up training at the cost of ressources. Defaults to 10.
+
+    Returns:
+        FdlNet: Best checkpoint for the trained model.
+    """
     labels = train_data.columns[2:]
 
     # Create datasets
