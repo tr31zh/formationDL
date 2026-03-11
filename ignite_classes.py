@@ -19,15 +19,10 @@ from sklearn.metrics import classification_report
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import StepLR
-
-from torchvision.models import swin_v2_b, Swin_V2_B_Weights
-
-from torchmetrics.classification import MultilabelF1Score
 
 import ignite
 from ignite.engine import Engine, Events
@@ -59,7 +54,6 @@ from transformers import (
 
 TMP_IGNITE_CHKPT_NAME = "best_ignite_chkpt.pt"
 PT_TMP_CHK_IGNITE = Path(".").joinpath("tmp").joinpath("checkpoints")
-EXP_NAME = "image_labeller"
 
 
 def ensure_folder(forced_path, return_string: bool = True):
@@ -366,7 +360,6 @@ class FdlNet(nn.Module):
         # Model
         chk_data = checkpoints_dict[backbone]
         self.labels = labels
-        # self.encoder = swin_v2_b(weights=Swin_V2_B_Weights.DEFAULT)
         self.encoder = chk_data["class"].from_pretrained(
             chk_data["path"],
             num_labels=len(labels),
@@ -376,7 +369,6 @@ class FdlNet(nn.Module):
             ignore_mismatched_sizes=True,
         )
         self.linear = nn.Linear(len(labels), len(labels))
-        # self.linear = nn.Linear(1000, len(labels))
         self.sigmoid = nn.Sigmoid()
         self.device = device if device is not None else get_device()
 
@@ -450,19 +442,6 @@ class FdlNet(nn.Module):
 
         return torch.cat(predictions).numpy()
 
-    def get_probas_and_labels(
-        self,
-        dataset: FldDataset,
-        batch_size: int = 32,
-        num_workers: int = 10,
-    ):
-        y_true = self.get_labels(dataset=dataset)
-        y_proba = self.predict_propabilities(
-            dataset=dataset, batch_size=batch_size, num_workers=num_workers
-        )
-
-        return y_proba, y_true
-
     def get_roc_df(self, y_true, y_proba):
         fpr, tpr, thresholds = roc_curve(y_true, y_proba)
         return pd.DataFrame().assign(
@@ -475,7 +454,8 @@ class FdlNet(nn.Module):
     def set_thresholds(
         self, dataset: FldDataset, batch_size: int = 32, num_workers: int = 10
     ) -> pd.DataFrame:
-        y_proba, y_true = self.get_probas_and_labels(
+        y_true = self.get_labels(dataset=dataset)
+        y_proba = self.predict_propabilities(
             dataset=dataset, batch_size=batch_size, num_workers=num_workers
         )
 
@@ -799,6 +779,7 @@ def log_csv(df, name, folder_name):
 
 
 def add_logger(
+    exp_name,
     trainer,
     logged_params,
     optimizer,
@@ -813,7 +794,7 @@ def add_logger(
 ):
     lcl_print("Creating logger", print_steps=print_steps)
     # Set experiment
-    mlflow.set_experiment(EXP_NAME)
+    mlflow.set_experiment(exp_name)
 
     # Define a Tensorboard logger
     mlf_logger = mlflow_logger.MLflowLogger()
@@ -929,6 +910,8 @@ def train_model(
     batch_size: int,
     max_epochs: int,
     image_size: int,
+    run_owner: str,
+    exp_name: str = "image_labeller",
     backbone: str = "hf_swt_t",
     loss_name: str = "bce",
     loss_params: dict = {"alpha": 0.5, "gamma": 1},
@@ -953,6 +936,8 @@ def train_model(
         batch_size (int): Batch size
         max_epochs (int): Max number of allowed epochs
         image_size (int): Training image size
+        run_owner (str): Person who launched the run, used to filter in mlflow. May be redundant as mlflow register user name.
+        exp_name (str): Experiment's name, used to filter in mlflow. Defaults to "image_labeller".
         backbone (str, optional): Selected backbone, one of "checkpoints_dict" keys. Defaults to "hf_swt_t".
         loss_name (str, optional): Loss name, either "bce" or "focal". If "focal" is selected, loss_params may contain a value for "alpha" and "gamma". Defaults to "bce".
         loss_params (dict, optional): Arguments for the focal loss. Defaults to {"alpha": 0.5, "gamma": 1}.
@@ -1042,6 +1027,7 @@ def train_model(
     try:
         # Add logger
         mlf_logger = add_logger(
+            exp_name=exp_name,
             trainer=trainer,
             logged_params={
                 "batch_size": batch_size,
@@ -1065,6 +1051,7 @@ def train_model(
                 "log_progress": log_progress,
                 "plot_loss": plot_loss,
                 "num_workers": num_workers,
+                "run_owner": run_owner,
             },
             optimizer=optimizer,
             train=train_data,

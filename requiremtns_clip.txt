@@ -1,0 +1,8 @@
+numpy
+pandas
+tqdm
+ipywidgets
+transformers
+open_clip_torch
+panel
+jupyter_bokeh
