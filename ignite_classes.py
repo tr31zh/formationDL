@@ -888,7 +888,7 @@ def upload_model_to_logger(
     )
     mlflow.log_params(
         {
-            f"F1_{label}": fscore
+            f"F1_{label}".replace(" ", "_"): fscore
             for label, fscore in val_data["classification_report"][
                 ["labels", "f1-score"]
             ].values

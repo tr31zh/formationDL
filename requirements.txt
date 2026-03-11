@@ -1,0 +1,17 @@
+albumentations
+ipywidgets
+jupyterlab
+livelossplot
+matplotlib
+mlflow
+numpy
+opencv-python
+pandas
+pytorch-ignite
+rich
+scikit-learn
+scipy
+torch
+torchvision
+transformers
+tqdm
